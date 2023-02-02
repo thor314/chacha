@@ -1,6 +1,6 @@
-use tkcrypto::chacha::{ChaCha20, Key, Nonce};
 use cipher::{KeyIvInit, StreamCipher};
 use hex_literal::hex;
+use tkcrypto::chacha::{ChaCha20, Key, Nonce};
 
 // ChaCha20 test vectors from:
 // <https://datatracker.ietf.org/doc/html/rfc8439#section-2.4.2>
