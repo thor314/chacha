@@ -11,6 +11,7 @@ set -euo pipefail # exit immediately if command ends with non-zero exit status.
 # rustup component add rustfmt
 
 # lint test fmt 
+rustup default nightly
 cargo clippy -- -Dwarnings
 cargo test --all-features --verbose
 cargo fmt --all -- --check
