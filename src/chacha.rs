@@ -99,13 +99,13 @@ impl<const R: usize> StreamCipherCore for ChaChaCore<R> {
 
   /// Process data using backend provided to the rank-2 closure.
   fn process_with_backend(&mut self, f: impl cipher::StreamClosure<BlockSize = Self::BlockSize>) {
-    // cfg_if::cfg_if! {
-    //   if #[cfg(feature = "simd")] {
+    cfg_if::cfg_if! {
+      if #[cfg(feature = "simd")] {
     f.call(&mut portable_simd::Backend(self));
-    //   } else {
-    //     f.call(&mut software::Backend(self));
-    //   }
-    // }
+      } else {
+        f.call(&mut software::Backend(self));
+      }
+    }
   }
 }
 
@@ -151,12 +151,11 @@ mod software {
     let mut res = *state;
 
     for _ in 0..R {
-      // column rounds
       quarter_round(0, 4, 8, 12, &mut res);
       quarter_round(1, 5, 9, 13, &mut res);
       quarter_round(2, 6, 10, 14, &mut res);
       quarter_round(3, 7, 11, 15, &mut res);
-      // diagonal rounds
+
       quarter_round(0, 5, 10, 15, &mut res);
       quarter_round(1, 6, 11, 12, &mut res);
       quarter_round(2, 7, 8, 13, &mut res);
@@ -185,13 +184,11 @@ mod software {
   }
 }
 
-// // TODO(TK): uncomment
-// #[cfg(feature = "simd")]
+#[cfg(feature = "simd")]
 mod portable_simd {
   use std::simd::u32x4;
 
   use cipher::{BlockSizeUser, ParBlocksSizeUser, StreamBackend};
-  use once_cell::sync::Lazy;
   use typenum::{U4, U64};
 
   use super::{Block, ChaChaCore, STATE_WORDS};
@@ -219,130 +216,50 @@ mod portable_simd {
 
   #[inline(always)]
   fn run_rounds<const R: usize>(state: &[u32; STATE_WORDS]) -> [u32; STATE_WORDS] {
-    let res = *state;
-
-    let mut chunks = res.array_chunks::<4>();
-    let a = u32x4::from_array(*chunks.next().unwrap());
-    let b = u32x4::from_array(*chunks.next().unwrap());
-    let c = u32x4::from_array(*chunks.next().unwrap());
-    let d = u32x4::from_array(*chunks.next().unwrap());
-    let old = [a, b, c, d];
-
-    let aa = a;
-    let bb = b.rotate_lanes_left::<1>();
-    let cc = c.rotate_lanes_left::<2>();
-    let dd = d.rotate_lanes_left::<3>();
+    // let mut res = *state;
+    let mut vectors = [u32x4::default(); 4];
+    for (i, chunk) in (*state).into_iter().array_chunks::<4>().enumerate() {
+      vectors[i] = u32x4::from_array(chunk);
+    }
 
     for _ in 0..R {
-      round(a, b, c, d); // vertical
-      round(aa, bb, cc, dd); // diagonal
+      round(&mut vectors);
+      vectors[1] = vectors[1].rotate_lanes_left::<1>();
+      vectors[2] = vectors[2].rotate_lanes_left::<2>();
+      vectors[3] = vectors[3].rotate_lanes_left::<3>();
+      round(&mut vectors);
+      vectors[1] = vectors[1].rotate_lanes_right::<1>();
+      vectors[2] = vectors[2].rotate_lanes_right::<2>();
+      vectors[3] = vectors[3].rotate_lanes_right::<3>();
     }
+    let mut res = [0u32; 16];
+    vectors
+      .iter_mut()
+      .enumerate()
+      .for_each(|(i, v)| res[(4 * i)..(4 * i + 4)].copy_from_slice(v.as_array()));
 
-    let mut out = [0; 16];
-    for (i, v) in
-      [a, b, c, d].into_iter().zip(old).flat_map(|(s, old)| *(s + old).as_array()).enumerate()
-    {
-      out[i] = v;
+    for (s1, s0) in res.iter_mut().zip(state.iter()) {
+      *s1 = s1.wrapping_add(*s0);
     }
-    out
+    res
   }
 
-  static S7: Lazy<u32x4> = Lazy::new(|| u32x4::splat(7));
-  static S8: Lazy<u32x4> = Lazy::new(|| u32x4::splat(8));
-  static S12: Lazy<u32x4> = Lazy::new(|| u32x4::splat(12));
-  static S16: Lazy<u32x4> = Lazy::new(|| u32x4::splat(16));
+  fn round(vectors: &mut [u32x4; 4]) {
+    vectors[0] += vectors[1];
+    vectors[3] ^= vectors[0];
+    // there doesn't seem to be an efficient way to map bit-rotation across Simd types
+    vectors[3] = u32x4::from_array(vectors[3].as_mut_array().map(|el| el.rotate_left(16)));
 
-  /// The ChaCha20 quarter round function
-  #[allow(unused_assignments)]
-  fn round(mut a: u32x4, mut b: u32x4, mut c: u32x4, mut d: u32x4) {
-    // simd addition opreations are inherently wrapping
-    a += b;
-    d = (d ^ a) << *S16;
+    vectors[2] += vectors[3];
+    vectors[1] ^= vectors[2];
+    vectors[1] = u32x4::from_array(vectors[1].as_mut_array().map(|el| el.rotate_left(12)));
 
-    c += d;
-    b = (b ^ c) << *S12;
+    vectors[0] += vectors[1];
+    vectors[3] ^= vectors[0];
+    vectors[3] = u32x4::from_array(vectors[3].as_mut_array().map(|el| el.rotate_left(8)));
 
-    a += b;
-    d = (d ^ a) << *S8;
-
-    c += d;
-    b = (b ^ c) << *S7;
-  }
-  #[cfg(test)]
-  mod test {
-    use cipher::{KeyIvInit, StreamCipher};
-    use hex_literal::hex;
-
-    use super::*;
-    use crate::chacha::{ChaCha20, Key, Nonce};
-
-    // ChaCha20 test vectors from:
-    // <https://datatracker.ietf.org/doc/html/rfc8439#section-2.4.2>
-
-    const KEY: [u8; 32] = hex!("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
-
-    const IV: [u8; 12] = hex!("000000000000004a00000000");
-
-    const PLAINTEXT: [u8; 114] = hex!(
-      "
-        4c616469657320616e642047656e746c
-        656d656e206f662074686520636c6173
-        73206f66202739393a20496620492063
-        6f756c64206f6666657220796f75206f
-        6e6c79206f6e652074697020666f7220
-        746865206675747572652c2073756e73
-        637265656e20776f756c642062652069
-        742e
-        "
-    );
-
-    const KEYSTREAM: [u8; 114] = hex!(
-      "
-        224f51f3401bd9e12fde276fb8631ded8c131f823d2c06
-        e27e4fcaec9ef3cf788a3b0aa372600a92b57974cded2b
-        9334794cba40c63e34cdea212c4cf07d41b769a6749f3f
-        630f4122cafe28ec4dc47e26d4346d70b98c73f3e9c53a
-        c40c5945398b6eda1a832c89c167eacd901d7e2bf363
-        "
-    );
-
-    const CIPHERTEXT: [u8; 114] = hex!(
-      "
-        6e2e359a2568f98041ba0728dd0d6981
-        e97e7aec1d4360c20a27afccfd9fae0b
-        f91b65c5524733ab8f593dabcd62b357
-        1639d624e65152ab8f530c359f0861d8
-        07ca0dbf500d6a6156a38e088a22b65e
-        52bc514d16ccf806818ce91ab7793736
-        5af90bbf74a35be6b40b8eedf2785e42
-        874d
-        "
-    );
-
-    #[test]
-    fn chacha20_keystream() {
-      let mut cipher = ChaCha20::new(&Key::from(KEY), &Nonce::from(IV));
-
-      // The test vectors omit the first 64-bytes of the keystream
-      let mut prefix = [0u8; 64];
-      cipher.apply_keystream(&mut prefix);
-
-      let mut buf = [0u8; 114];
-      cipher.apply_keystream(&mut buf);
-      assert_eq!(&buf[..], &KEYSTREAM[..]);
-    }
-
-    #[test]
-    fn chacha20_encryption() {
-      let mut cipher = ChaCha20::new(&Key::from(KEY), &Nonce::from(IV));
-      let mut buf = PLAINTEXT;
-
-      // The test vectors omit the first 64-bytes of the keystream
-      let mut prefix = [0u8; 64];
-      cipher.apply_keystream(&mut prefix);
-
-      cipher.apply_keystream(&mut buf);
-      assert_eq!(&buf[..], &CIPHERTEXT[..]);
-    }
+    vectors[2] += vectors[3];
+    vectors[1] ^= vectors[2];
+    vectors[1] = u32x4::from_array(vectors[1].as_mut_array().map(|el| el.rotate_left(7)));
   }
 }

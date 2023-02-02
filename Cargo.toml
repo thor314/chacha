@@ -9,29 +9,26 @@ version    ="0.1.0"
 
 [dependencies]
 # Error Handling
-anyhow   ="1.0"
-cfg-if = "1.0.0"
-cipher = "0.4.3"
-generic-array = "0.14.6"
-once_cell = "1.17.0"
-rayon = "1.6.1"
-secrecy = "0.8.0"
-thiserror="1.0"
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] } 
-typenum = "1.16.0"
-zeroize = { version = "1.5.7", features = ["zeroize_derive"] }
+# anyhow   ="1.0"
+cfg-if       ="1.0.0"
+cipher       ="0.4.3"
+generic-array="0.14.6"
+secrecy      ="0.8.0"
+# thiserror="1.0"
+# tracing = "0.1"
+# tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] } 
+typenum="1.16.0"
+zeroize={ version="1.5.7", features=["zeroize_derive"] }
 
 [features]
 # Compile with portable SIMD acceleration
-simd = []
+simd=[]
 
 [dev-dependencies]
-hex-literal = "0.3.4"
+hex-literal="0.3.4"
 
 ## Bench ##
-criterion = "0.4"
+criterion="0.4"
 # iai = "0.1" # criterion alternative
 
 ## Testing utils
@@ -44,9 +41,9 @@ criterion = "0.4"
 # rstest = "0.16"         # testing convenience proc-macros
 
 [[test]]
-name = "chacha"
-path = "tests/chacha.rs"
+name="chacha"
+path="tests/chacha.rs"
 
 [[bench]]
-name = "bench"
-harness = false
+name   ="bench"
+harness=false
