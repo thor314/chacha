@@ -15,7 +15,7 @@ pub fn bench(c: &mut Criterion) {
   let mut cipher = ChaCha8::new(&key, &iv);
   let mut buf = vec![1u8; KB];
 
-  c.bench_function("benchsoft", |b| b.iter(|| cipher.apply_keystream(black_box(&mut buf))));
+  c.bench_function("bench", |b| b.iter(|| cipher.apply_keystream(black_box(&mut buf))));
 }
 
 criterion_group!(benches, bench);

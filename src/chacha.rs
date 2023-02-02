@@ -99,7 +99,11 @@ impl<const R: usize> StreamCipherCore for ChaChaCore<R> {
   fn process_with_backend(&mut self, f: impl cipher::StreamClosure<BlockSize = Self::BlockSize>) {
     cfg_if::cfg_if! {
       if #[cfg(feature = "simd")] {
-    f.call(&mut portable_simd::Backend(self));
+        f.call(&mut portable_simd::Backend(self));
+      } else if #[cfg(feature = "avx2")] {
+        unsafe { avx2::inner::<R, _>(&mut self.state, f); }
+      } else if #[cfg(feature = "sse2")] {
+        unsafe { sse2::inner::<R, _>(&mut self.state, f); }
       } else {
         f.call(&mut software::Backend(self));
       }
@@ -117,6 +121,7 @@ impl<const R: usize> StreamCipherSeekCore for ChaChaCore<R> {
   fn set_block_pos(&mut self, pos: Self::Counter) { self.state[12] = pos; }
 }
 
+// ~2.1 microseconds
 mod software {
   use cipher::{BlockSizeUser, ParBlocksSizeUser, StreamBackend};
   use typenum::consts::{U1, U64};
@@ -183,6 +188,7 @@ mod software {
 }
 
 // note: 30-40% faster than software backend on x86_64
+// 1.5 microseconds
 #[cfg(feature = "simd")]
 mod portable_simd {
   use core::simd::u32x4;
@@ -266,5 +272,432 @@ mod portable_simd {
     vectors[2] += vectors[3];
     vectors[1] ^= vectors[2];
     vectors[1] = u32x4::from_array(vectors[1].as_mut_array().map(|el| el.rotate_left(7)));
+  }
+}
+
+// Code beneath this point is only included for benchmark comparison purposes, and is entirely
+// copied from Rust Crypto, with a couple tweaks for const generics
+//
+// 927ns (about 2.5x faster than software)
+#[cfg(feature = "sse2")]
+mod sse2 {
+  #[cfg(target_arch = "x86")] use core::arch::x86::*;
+  #[cfg(target_arch = "x86_64")] use core::arch::x86_64::*;
+
+  use cipher::{
+    consts::{U1, U64},
+    BlockSizeUser, ParBlocksSizeUser, StreamBackend, StreamClosure,
+  };
+
+  use super::{Block, STATE_WORDS};
+
+  #[inline]
+  #[target_feature(enable = "sse2")]
+  pub(crate) unsafe fn inner<const R: usize, F>(state: &mut [u32; STATE_WORDS], f: F)
+  where F: StreamClosure<BlockSize = U64> {
+    let state_ptr = state.as_ptr() as *const __m128i;
+    let mut backend = Backend::<R> {
+      v: [
+        _mm_loadu_si128(state_ptr.add(0)),
+        _mm_loadu_si128(state_ptr.add(1)),
+        _mm_loadu_si128(state_ptr.add(2)),
+        _mm_loadu_si128(state_ptr.add(3)),
+      ],
+    };
+
+    f.call(&mut backend);
+
+    state[12] = _mm_cvtsi128_si32(backend.v[3]) as u32;
+  }
+
+  struct Backend<const R: usize> {
+    v: [__m128i; 4],
+  }
+
+  impl<const R: usize> BlockSizeUser for Backend<R> {
+    type BlockSize = U64;
+  }
+
+  impl<const R: usize> ParBlocksSizeUser for Backend<R> {
+    type ParBlocksSize = U1;
+  }
+
+  impl<const R: usize> StreamBackend for Backend<R> {
+    #[inline(always)]
+    fn gen_ks_block(&mut self, block: &mut Block) {
+      unsafe {
+        let res = rounds::<R>(&self.v);
+        self.v[3] = _mm_add_epi32(self.v[3], _mm_set_epi32(0, 0, 0, 1));
+
+        let block_ptr = block.as_mut_ptr() as *mut __m128i;
+        for i in 0..4 {
+          _mm_storeu_si128(block_ptr.add(i), res[i]);
+        }
+      }
+    }
+  }
+
+  #[inline]
+  #[target_feature(enable = "sse2")]
+  unsafe fn rounds<const R: usize>(v: &[__m128i; 4]) -> [__m128i; 4] {
+    let mut res = *v;
+    for _ in 0..R {
+      double_quarter_round(&mut res);
+    }
+
+    for i in 0..4 {
+      res[i] = _mm_add_epi32(res[i], v[i]);
+    }
+
+    res
+  }
+
+  #[inline]
+  #[target_feature(enable = "sse2")]
+  unsafe fn double_quarter_round(v: &mut [__m128i; 4]) {
+    add_xor_rot(v);
+    rows_to_cols(v);
+    add_xor_rot(v);
+    cols_to_rows(v);
+  }
+
+  /// The goal of this function is to transform the state words from:
+  /// ```text
+  /// [a0, a1, a2, a3]    [ 0,  1,  2,  3]
+  /// [b0, b1, b2, b3] == [ 4,  5,  6,  7]
+  /// [c0, c1, c2, c3]    [ 8,  9, 10, 11]
+  /// [d0, d1, d2, d3]    [12, 13, 14, 15]
+  /// ```
+  ///
+  /// to:
+  /// ```text
+  /// [a0, a1, a2, a3]    [ 0,  1,  2,  3]
+  /// [b1, b2, b3, b0] == [ 5,  6,  7,  4]
+  /// [c2, c3, c0, c1]    [10, 11,  8,  9]
+  /// [d3, d0, d1, d2]    [15, 12, 13, 14]
+  /// ```
+  ///
+  /// so that we can apply [`add_xor_rot`] to the resulting columns, and have it compute the
+  /// "diagonal rounds" (as defined in RFC 7539) in parallel. In practice, this shuffle is
+  /// non-optimal: the last state word to be altered in `add_xor_rot` is `b`, so the shuffle
+  /// blocks on the result of `b` being calculated.
+  ///
+  /// We can optimize this by observing that the four quarter rounds in `add_xor_rot` are
+  /// data-independent: they only access a single column of the state, and thus the order of
+  /// the columns does not matter. We therefore instead shuffle the other three state words,
+  /// to obtain the following equivalent layout:
+  /// ```text
+  /// [a3, a0, a1, a2]    [ 3,  0,  1,  2]
+  /// [b0, b1, b2, b3] == [ 4,  5,  6,  7]
+  /// [c1, c2, c3, c0]    [ 9, 10, 11,  8]
+  /// [d2, d3, d0, d1]    [14, 15, 12, 13]
+  /// ```
+  ///
+  /// See https://github.com/sneves/blake2-avx2/pull/4 for additional details. The earliest
+  /// known occurrence of this optimization is in floodyberry's SSE4 ChaCha code from 2014:
+  /// - https://github.com/floodyberry/chacha-opt/blob/0ab65cb99f5016633b652edebaf3691ceb4ff753/chacha_blocks_ssse3-64.S#L639-L643
+  #[inline]
+  #[target_feature(enable = "sse2")]
+  unsafe fn rows_to_cols([a, _, c, d]: &mut [__m128i; 4]) {
+    // c >>>= 32; d >>>= 64; a >>>= 96;
+    *c = _mm_shuffle_epi32(*c, 0b_00_11_10_01); // _MM_SHUFFLE(0, 3, 2, 1)
+    *d = _mm_shuffle_epi32(*d, 0b_01_00_11_10); // _MM_SHUFFLE(1, 0, 3, 2)
+    *a = _mm_shuffle_epi32(*a, 0b_10_01_00_11); // _MM_SHUFFLE(2, 1, 0, 3)
+  }
+
+  /// The goal of this function is to transform the state words from:
+  /// ```text
+  /// [a3, a0, a1, a2]    [ 3,  0,  1,  2]
+  /// [b0, b1, b2, b3] == [ 4,  5,  6,  7]
+  /// [c1, c2, c3, c0]    [ 9, 10, 11,  8]
+  /// [d2, d3, d0, d1]    [14, 15, 12, 13]
+  /// ```
+  ///
+  /// to:
+  /// ```text
+  /// [a0, a1, a2, a3]    [ 0,  1,  2,  3]
+  /// [b0, b1, b2, b3] == [ 4,  5,  6,  7]
+  /// [c0, c1, c2, c3]    [ 8,  9, 10, 11]
+  /// [d0, d1, d2, d3]    [12, 13, 14, 15]
+  /// ```
+  ///
+  /// reversing the transformation of [`rows_to_cols`].
+  #[inline]
+  #[target_feature(enable = "sse2")]
+  unsafe fn cols_to_rows([a, _, c, d]: &mut [__m128i; 4]) {
+    // c <<<= 32; d <<<= 64; a <<<= 96;
+    *c = _mm_shuffle_epi32(*c, 0b_10_01_00_11); // _MM_SHUFFLE(2, 1, 0, 3)
+    *d = _mm_shuffle_epi32(*d, 0b_01_00_11_10); // _MM_SHUFFLE(1, 0, 3, 2)
+    *a = _mm_shuffle_epi32(*a, 0b_00_11_10_01); // _MM_SHUFFLE(0, 3, 2, 1)
+  }
+
+  #[inline]
+  #[target_feature(enable = "sse2")]
+  unsafe fn add_xor_rot([a, b, c, d]: &mut [__m128i; 4]) {
+    // a += b; d ^= a; d <<<= (16, 16, 16, 16);
+    *a = _mm_add_epi32(*a, *b);
+    *d = _mm_xor_si128(*d, *a);
+    *d = _mm_xor_si128(_mm_slli_epi32(*d, 16), _mm_srli_epi32(*d, 16));
+
+    // c += d; b ^= c; b <<<= (12, 12, 12, 12);
+    *c = _mm_add_epi32(*c, *d);
+    *b = _mm_xor_si128(*b, *c);
+    *b = _mm_xor_si128(_mm_slli_epi32(*b, 12), _mm_srli_epi32(*b, 20));
+
+    // a += b; d ^= a; d <<<= (8, 8, 8, 8);
+    *a = _mm_add_epi32(*a, *b);
+    *d = _mm_xor_si128(*d, *a);
+    *d = _mm_xor_si128(_mm_slli_epi32(*d, 8), _mm_srli_epi32(*d, 24));
+
+    // c += d; b ^= c; b <<<= (7, 7, 7, 7);
+    *c = _mm_add_epi32(*c, *d);
+    *b = _mm_xor_si128(*b, *c);
+    *b = _mm_xor_si128(_mm_slli_epi32(*b, 7), _mm_srli_epi32(*b, 25));
+  }
+}
+
+// 271 nanoseconds (about 9x faster than software)
+#[cfg(feature = "avx2")]
+mod avx2 {
+  #[cfg(target_arch = "x86")] use core::arch::x86::*;
+  #[cfg(target_arch = "x86_64")] use core::arch::x86_64::*;
+
+  use cipher::{
+    consts::{U4, U64},
+    BlockSizeUser, ParBlocks, ParBlocksSizeUser, StreamBackend, StreamClosure,
+  };
+
+  use super::{Block, STATE_WORDS};
+
+  /// Number of blocks processed in parallel.
+  const PAR_BLOCKS: usize = 4;
+  /// Number of `__m256i` to store parallel blocks.
+  const N: usize = PAR_BLOCKS / 2;
+
+  #[inline]
+  #[target_feature(enable = "avx2")]
+  pub(crate) unsafe fn inner<const R: usize, F>(state: &mut [u32; STATE_WORDS], f: F)
+  where F: StreamClosure<BlockSize = U64> {
+    let state_ptr = state.as_ptr() as *const __m128i;
+    let v = [
+      _mm256_broadcastsi128_si256(_mm_loadu_si128(state_ptr.add(0))),
+      _mm256_broadcastsi128_si256(_mm_loadu_si128(state_ptr.add(1))),
+      _mm256_broadcastsi128_si256(_mm_loadu_si128(state_ptr.add(2))),
+    ];
+    let mut c = _mm256_broadcastsi128_si256(_mm_loadu_si128(state_ptr.add(3)));
+    c = _mm256_add_epi32(c, _mm256_set_epi32(0, 0, 0, 1, 0, 0, 0, 0));
+    let mut ctr = [c; N];
+    for i in 0..N {
+      ctr[i] = c;
+      c = _mm256_add_epi32(c, _mm256_set_epi32(0, 0, 0, 2, 0, 0, 0, 2));
+    }
+    let mut backend = Backend::<R> { v, ctr };
+
+    f.call(&mut backend);
+
+    state[12] = _mm256_extract_epi32(backend.ctr[0], 0) as u32;
+  }
+
+  struct Backend<const R: usize> {
+    v:   [__m256i; 3],
+    ctr: [__m256i; N],
+  }
+
+  impl<const R: usize> BlockSizeUser for Backend<R> {
+    type BlockSize = U64;
+  }
+
+  impl<const R: usize> ParBlocksSizeUser for Backend<R> {
+    type ParBlocksSize = U4;
+  }
+
+  impl<const R: usize> StreamBackend for Backend<R> {
+    #[inline(always)]
+    fn gen_ks_block(&mut self, block: &mut Block) {
+      unsafe {
+        let res = rounds::<R>(&self.v, &self.ctr);
+        for c in self.ctr.iter_mut() {
+          *c = _mm256_add_epi32(*c, _mm256_set_epi32(0, 0, 0, 1, 0, 0, 0, 1));
+        }
+
+        let res0: [__m128i; 8] = core::mem::transmute(res[0]);
+
+        let block_ptr = block.as_mut_ptr() as *mut __m128i;
+        for i in 0..4 {
+          _mm_storeu_si128(block_ptr.add(i), res0[2 * i]);
+        }
+      }
+    }
+
+    #[inline(always)]
+    fn gen_par_ks_blocks(&mut self, blocks: &mut ParBlocks<Self>) {
+      unsafe {
+        let vs = rounds::<R>(&self.v, &self.ctr);
+
+        let pb = PAR_BLOCKS as i32;
+        for c in self.ctr.iter_mut() {
+          *c = _mm256_add_epi32(*c, _mm256_set_epi32(0, 0, 0, pb, 0, 0, 0, pb));
+        }
+
+        let mut block_ptr = blocks.as_mut_ptr() as *mut __m128i;
+        for v in vs {
+          let t: [__m128i; 8] = core::mem::transmute(v);
+          for i in 0..4 {
+            _mm_storeu_si128(block_ptr.add(i), t[2 * i]);
+            _mm_storeu_si128(block_ptr.add(4 + i), t[2 * i + 1]);
+          }
+          block_ptr = block_ptr.add(8);
+        }
+      }
+    }
+  }
+
+  #[inline]
+  #[target_feature(enable = "avx2")]
+  unsafe fn rounds<const R: usize>(v: &[__m256i; 3], c: &[__m256i; N]) -> [[__m256i; 4]; N] {
+    let mut vs: [[__m256i; 4]; N] = [[_mm256_setzero_si256(); 4]; N];
+    for i in 0..N {
+      vs[i] = [v[0], v[1], v[2], c[i]];
+    }
+    for _ in 0..R {
+      double_quarter_round(&mut vs);
+    }
+
+    for i in 0..N {
+      for j in 0..3 {
+        vs[i][j] = _mm256_add_epi32(vs[i][j], v[j]);
+      }
+      vs[i][3] = _mm256_add_epi32(vs[i][3], c[i]);
+    }
+
+    vs
+  }
+
+  #[inline]
+  #[target_feature(enable = "avx2")]
+  unsafe fn double_quarter_round(v: &mut [[__m256i; 4]; N]) {
+    add_xor_rot(v);
+    rows_to_cols(v);
+    add_xor_rot(v);
+    cols_to_rows(v);
+  }
+
+  /// The goal of this function is to transform the state words from:
+  /// ```text
+  /// [a0, a1, a2, a3]    [ 0,  1,  2,  3]
+  /// [b0, b1, b2, b3] == [ 4,  5,  6,  7]
+  /// [c0, c1, c2, c3]    [ 8,  9, 10, 11]
+  /// [d0, d1, d2, d3]    [12, 13, 14, 15]
+  /// ```
+  ///
+  /// to:
+  /// ```text
+  /// [a0, a1, a2, a3]    [ 0,  1,  2,  3]
+  /// [b1, b2, b3, b0] == [ 5,  6,  7,  4]
+  /// [c2, c3, c0, c1]    [10, 11,  8,  9]
+  /// [d3, d0, d1, d2]    [15, 12, 13, 14]
+  /// ```
+  ///
+  /// so that we can apply [`add_xor_rot`] to the resulting columns, and have it compute the
+  /// "diagonal rounds" (as defined in RFC 7539) in parallel. In practice, this shuffle is
+  /// non-optimal: the last state word to be altered in `add_xor_rot` is `b`, so the shuffle
+  /// blocks on the result of `b` being calculated.
+  ///
+  /// We can optimize this by observing that the four quarter rounds in `add_xor_rot` are
+  /// data-independent: they only access a single column of the state, and thus the order of
+  /// the columns does not matter. We therefore instead shuffle the other three state words,
+  /// to obtain the following equivalent layout:
+  /// ```text
+  /// [a3, a0, a1, a2]    [ 3,  0,  1,  2]
+  /// [b0, b1, b2, b3] == [ 4,  5,  6,  7]
+  /// [c1, c2, c3, c0]    [ 9, 10, 11,  8]
+  /// [d2, d3, d0, d1]    [14, 15, 12, 13]
+  /// ```
+  ///
+  /// See https://github.com/sneves/blake2-avx2/pull/4 for additional details. The earliest
+  /// known occurrence of this optimization is in floodyberry's SSE4 ChaCha code from 2014:
+  /// - https://github.com/floodyberry/chacha-opt/blob/0ab65cb99f5016633b652edebaf3691ceb4ff753/chacha_blocks_ssse3-64.S#L639-L643
+  #[inline]
+  #[target_feature(enable = "avx2")]
+  unsafe fn rows_to_cols(vs: &mut [[__m256i; 4]; N]) {
+    // c >>>= 32; d >>>= 64; a >>>= 96;
+    for [a, _, c, d] in vs {
+      *c = _mm256_shuffle_epi32(*c, 0b_00_11_10_01); // _MM_SHUFFLE(0, 3, 2, 1)
+      *d = _mm256_shuffle_epi32(*d, 0b_01_00_11_10); // _MM_SHUFFLE(1, 0, 3, 2)
+      *a = _mm256_shuffle_epi32(*a, 0b_10_01_00_11); // _MM_SHUFFLE(2, 1, 0, 3)
+    }
+  }
+
+  /// The goal of this function is to transform the state words from:
+  /// ```text
+  /// [a3, a0, a1, a2]    [ 3,  0,  1,  2]
+  /// [b0, b1, b2, b3] == [ 4,  5,  6,  7]
+  /// [c1, c2, c3, c0]    [ 9, 10, 11,  8]
+  /// [d2, d3, d0, d1]    [14, 15, 12, 13]
+  /// ```
+  ///
+  /// to:
+  /// ```text
+  /// [a0, a1, a2, a3]    [ 0,  1,  2,  3]
+  /// [b0, b1, b2, b3] == [ 4,  5,  6,  7]
+  /// [c0, c1, c2, c3]    [ 8,  9, 10, 11]
+  /// [d0, d1, d2, d3]    [12, 13, 14, 15]
+  /// ```
+  ///
+  /// reversing the transformation of [`rows_to_cols`].
+  #[inline]
+  #[target_feature(enable = "avx2")]
+  unsafe fn cols_to_rows(vs: &mut [[__m256i; 4]; N]) {
+    // c <<<= 32; d <<<= 64; a <<<= 96;
+    for [a, _, c, d] in vs {
+      *c = _mm256_shuffle_epi32(*c, 0b_10_01_00_11); // _MM_SHUFFLE(2, 1, 0, 3)
+      *d = _mm256_shuffle_epi32(*d, 0b_01_00_11_10); // _MM_SHUFFLE(1, 0, 3, 2)
+      *a = _mm256_shuffle_epi32(*a, 0b_00_11_10_01); // _MM_SHUFFLE(0, 3, 2, 1)
+    }
+  }
+
+  #[inline]
+  #[target_feature(enable = "avx2")]
+  unsafe fn add_xor_rot(vs: &mut [[__m256i; 4]; N]) {
+    let rol16_mask = _mm256_set_epi64x(
+      0x0d0c_0f0e_0908_0b0a,
+      0x0504_0706_0100_0302,
+      0x0d0c_0f0e_0908_0b0a,
+      0x0504_0706_0100_0302,
+    );
+    let rol8_mask = _mm256_set_epi64x(
+      0x0e0d_0c0f_0a09_080b,
+      0x0605_0407_0201_0003,
+      0x0e0d_0c0f_0a09_080b,
+      0x0605_0407_0201_0003,
+    );
+
+    // a += b; d ^= a; d <<<= (16, 16, 16, 16);
+    for [a, b, _, d] in vs.iter_mut() {
+      *a = _mm256_add_epi32(*a, *b);
+      *d = _mm256_xor_si256(*d, *a);
+      *d = _mm256_shuffle_epi8(*d, rol16_mask);
+    }
+
+    // c += d; b ^= c; b <<<= (12, 12, 12, 12);
+    for [_, b, c, d] in vs.iter_mut() {
+      *c = _mm256_add_epi32(*c, *d);
+      *b = _mm256_xor_si256(*b, *c);
+      *b = _mm256_xor_si256(_mm256_slli_epi32(*b, 12), _mm256_srli_epi32(*b, 20));
+    }
+
+    // a += b; d ^= a; d <<<= (8, 8, 8, 8);
+    for [a, b, _, d] in vs.iter_mut() {
+      *a = _mm256_add_epi32(*a, *b);
+      *d = _mm256_xor_si256(*d, *a);
+      *d = _mm256_shuffle_epi8(*d, rol8_mask);
+    }
+
+    // c += d; b ^= c; b <<<= (7, 7, 7, 7);
+    for [_, b, c, d] in vs.iter_mut() {
+      *c = _mm256_add_epi32(*c, *d);
+      *b = _mm256_xor_si256(*b, *c);
+      *b = _mm256_xor_si256(_mm256_slli_epi32(*b, 7), _mm256_srli_epi32(*b, 25));
+    }
   }
 }

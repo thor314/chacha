@@ -23,6 +23,8 @@ zeroize={ version="1.5.7", features=["zeroize_derive"] }
 [features]
 # Compile with portable SIMD acceleration
 simd=[]
+avx2=[]
+sse2=[]
 
 [dev-dependencies]
 hex-literal="0.3.4"
