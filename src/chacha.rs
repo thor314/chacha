@@ -185,7 +185,7 @@ mod software {
 // note: 30-40% faster than software backend on x86_64
 #[cfg(feature = "simd")]
 mod portable_simd {
-  use std::simd::u32x4;
+  use core::simd::u32x4;
 
   use cipher::{BlockSizeUser, ParBlocksSizeUser, StreamBackend};
   use typenum::{U4, U64};
