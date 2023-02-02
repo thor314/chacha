@@ -293,6 +293,7 @@ mod sse2 {
 
   #[inline]
   #[target_feature(enable = "sse2")]
+  #[allow(dead_code)]
   pub(crate) unsafe fn inner<const R: usize, F>(state: &mut [u32; STATE_WORDS], f: F)
   where F: StreamClosure<BlockSize = U64> {
     let state_ptr = state.as_ptr() as *const __m128i;
@@ -330,9 +331,9 @@ mod sse2 {
         self.v[3] = _mm_add_epi32(self.v[3], _mm_set_epi32(0, 0, 0, 1));
 
         let block_ptr = block.as_mut_ptr() as *mut __m128i;
-        for i in 0..4 {
+        (0..4).for_each(|i| {
           _mm_storeu_si128(block_ptr.add(i), res[i]);
-        }
+        });
       }
     }
   }
@@ -476,6 +477,7 @@ mod avx2 {
 
   #[inline]
   #[target_feature(enable = "avx2")]
+  #[allow(dead_code)]
   pub(crate) unsafe fn inner<const R: usize, F>(state: &mut [u32; STATE_WORDS], f: F)
   where F: StreamClosure<BlockSize = U64> {
     let state_ptr = state.as_ptr() as *const __m128i;
@@ -487,10 +489,10 @@ mod avx2 {
     let mut c = _mm256_broadcastsi128_si256(_mm_loadu_si128(state_ptr.add(3)));
     c = _mm256_add_epi32(c, _mm256_set_epi32(0, 0, 0, 1, 0, 0, 0, 0));
     let mut ctr = [c; N];
-    for i in 0..N {
+    (0..N).for_each(|i| {
       ctr[i] = c;
       c = _mm256_add_epi32(c, _mm256_set_epi32(0, 0, 0, 2, 0, 0, 0, 2));
-    }
+    });
     let mut backend = Backend::<R> { v, ctr };
 
     f.call(&mut backend);
@@ -564,9 +566,7 @@ mod avx2 {
     }
 
     for i in 0..N {
-      for j in 0..3 {
-        vs[i][j] = _mm256_add_epi32(vs[i][j], v[j]);
-      }
+      (0..3).for_each(|j| vs[i][j] = _mm256_add_epi32(vs[i][j], v[j]));
       vs[i][3] = _mm256_add_epi32(vs[i][3], c[i]);
     }
 
