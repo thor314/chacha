@@ -10,8 +10,6 @@ use cipher::{
 use generic_array::GenericArray;
 use secrecy::DebugSecret;
 use typenum::{U12, U32, U64};
-// use typenum::consts::{U12, U32, U64};
-// use typenum::{U12, U32, U64, U4, U6, U10};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// State initialization constant ("expand 32-byte k")
@@ -140,7 +138,7 @@ mod software {
       let res = run_rounds::<R>(&self.0.state);
       self.0.state[12] = self.0.state[12].wrapping_add(1);
 
-      for (chunk, val) in block.chunks_exact_mut(4).zip(res.iter()) {
+      for (chunk, val) in block.array_chunks_mut::<4>().zip(res.iter()) {
         chunk.copy_from_slice(&val.to_le_bytes());
       }
     }
@@ -184,6 +182,7 @@ mod software {
   }
 }
 
+// note: 30-40% faster than software backend on x86_64
 #[cfg(feature = "simd")]
 mod portable_simd {
   use std::simd::u32x4;
@@ -216,7 +215,6 @@ mod portable_simd {
 
   #[inline(always)]
   fn run_rounds<const R: usize>(state: &[u32; STATE_WORDS]) -> [u32; STATE_WORDS] {
-    // let mut res = *state;
     let mut vectors = [u32x4::default(); 4];
     for (i, chunk) in (*state).into_iter().array_chunks::<4>().enumerate() {
       vectors[i] = u32x4::from_array(chunk);
@@ -232,7 +230,14 @@ mod portable_simd {
       vectors[2] = vectors[2].rotate_lanes_right::<2>();
       vectors[3] = vectors[3].rotate_lanes_right::<3>();
     }
-    let mut res = [0u32; 16];
+
+    // this is 40% slower...*shrug*
+    // let mut res = *state;
+    // for (r, x) in res.iter_mut().zip(vectors.iter().flat_map(|v| v.as_array())) {
+    //   *r = r.wrapping_add(*x);
+    // }
+
+    let mut res = [0; STATE_WORDS];
     vectors
       .iter_mut()
       .enumerate()
