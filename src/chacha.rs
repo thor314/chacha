@@ -198,6 +198,15 @@ mod portable_simd {
 
   use super::{Block, ChaChaCore, STATE_WORDS};
 
+  // failed experiment for speeding up bit-rotation
+  // static S25: Lazy<u32x4> = Lazy::new(|| u32x4::splat(25));
+  // static S24: Lazy<u32x4> = Lazy::new(|| u32x4::splat(24));
+  // static S20: Lazy<u32x4> = Lazy::new(|| u32x4::splat(20));
+  // static S16: Lazy<u32x4> = Lazy::new(|| u32x4::splat(16));
+  // static S12: Lazy<u32x4> = Lazy::new(|| u32x4::splat(12));
+  // static S8: Lazy<u32x4> = Lazy::new(|| u32x4::splat(8));
+  // static S7: Lazy<u32x4> = Lazy::new(|| u32x4::splat(7));
+
   pub(super) struct Backend<'a, const R: usize>(pub(super) &'a mut ChaChaCore<R>);
 
   impl<'a, const R: usize> BlockSizeUser for Backend<'a, R> {
@@ -258,20 +267,24 @@ mod portable_simd {
   fn round(vectors: &mut [u32x4; 4]) {
     vectors[0] += vectors[1];
     vectors[3] ^= vectors[0];
-    // there doesn't seem to be an efficient way to map bit-rotation across Simd types
     vectors[3] = u32x4::from_array(vectors[3].as_mut_array().map(|el| el.rotate_left(16)));
+    // there doesn't seem to be an efficient way to map bit-rotation across Simd types
+    // vectors[3] = (vectors[3] << *S16) ^ (vectors[3] >> *S16); // muuuch slower (2micros -> 4)
 
     vectors[2] += vectors[3];
     vectors[1] ^= vectors[2];
     vectors[1] = u32x4::from_array(vectors[1].as_mut_array().map(|el| el.rotate_left(12)));
+    // vectors[3] = (vectors[3] << *S12) ^ (vectors[3] >> *S20);
 
     vectors[0] += vectors[1];
     vectors[3] ^= vectors[0];
     vectors[3] = u32x4::from_array(vectors[3].as_mut_array().map(|el| el.rotate_left(8)));
+    // vectors[3] = (vectors[3] << *S8) ^ (vectors[3] >> *S24);
 
     vectors[2] += vectors[3];
     vectors[1] ^= vectors[2];
     vectors[1] = u32x4::from_array(vectors[1].as_mut_array().map(|el| el.rotate_left(7)));
+    // vectors[3] = (vectors[3] << *S7) ^ (vectors[3] >> *S25);
   }
 }
 
