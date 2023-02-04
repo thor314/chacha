@@ -121,7 +121,7 @@ impl<const R: usize> StreamCipherSeekCore for ChaChaCore<R> {
   fn set_block_pos(&mut self, pos: Self::Counter) { self.state[12] = pos; }
 }
 
-// ~2.1 microseconds
+// ~5.2ms to encrypt 1MB of data
 mod software {
   use cipher::{BlockSizeUser, ParBlocksSizeUser, StreamBackend};
   use typenum::consts::{U1, U64};
@@ -187,25 +187,16 @@ mod software {
   }
 }
 
-// note: 30-40% faster than software backend on x86_64
-// 1.5 microseconds
+// note: 1.4x faster than software backend on x86_64
+// 3.4ms to encrypt 1mb of data
 #[cfg(feature = "simd")]
 mod portable_simd {
-  use core::simd::u32x4;
+  use core::simd::{simd_swizzle, u32x16, u32x4};
 
   use cipher::{BlockSizeUser, ParBlocksSizeUser, StreamBackend};
   use typenum::{U4, U64};
 
   use super::{Block, ChaChaCore, STATE_WORDS};
-
-  // failed experiment for speeding up bit-rotation
-  // static S25: Lazy<u32x4> = Lazy::new(|| u32x4::splat(25));
-  // static S24: Lazy<u32x4> = Lazy::new(|| u32x4::splat(24));
-  // static S20: Lazy<u32x4> = Lazy::new(|| u32x4::splat(20));
-  // static S16: Lazy<u32x4> = Lazy::new(|| u32x4::splat(16));
-  // static S12: Lazy<u32x4> = Lazy::new(|| u32x4::splat(12));
-  // static S8: Lazy<u32x4> = Lazy::new(|| u32x4::splat(8));
-  // static S7: Lazy<u32x4> = Lazy::new(|| u32x4::splat(7));
 
   pub(super) struct Backend<'a, const R: usize>(pub(super) &'a mut ChaChaCore<R>);
 
@@ -246,12 +237,6 @@ mod portable_simd {
       vectors[3] = vectors[3].rotate_lanes_right::<3>();
     }
 
-    // this is 40% slower...*shrug*
-    // let mut res = *state;
-    // for (r, x) in res.iter_mut().zip(vectors.iter().flat_map(|v| v.as_array())) {
-    //   *r = r.wrapping_add(*x);
-    // }
-
     let mut res = [0; STATE_WORDS];
     vectors
       .iter_mut()
@@ -268,30 +253,114 @@ mod portable_simd {
     vectors[0] += vectors[1];
     vectors[3] ^= vectors[0];
     vectors[3] = u32x4::from_array(vectors[3].as_mut_array().map(|el| el.rotate_left(16)));
-    // there doesn't seem to be an efficient way to map bit-rotation across Simd types
-    // vectors[3] = (vectors[3] << *S16) ^ (vectors[3] >> *S16); // muuuch slower (2micros -> 4)
 
     vectors[2] += vectors[3];
     vectors[1] ^= vectors[2];
     vectors[1] = u32x4::from_array(vectors[1].as_mut_array().map(|el| el.rotate_left(12)));
-    // vectors[3] = (vectors[3] << *S12) ^ (vectors[3] >> *S20);
 
     vectors[0] += vectors[1];
     vectors[3] ^= vectors[0];
     vectors[3] = u32x4::from_array(vectors[3].as_mut_array().map(|el| el.rotate_left(8)));
-    // vectors[3] = (vectors[3] << *S8) ^ (vectors[3] >> *S24);
 
     vectors[2] += vectors[3];
     vectors[1] ^= vectors[2];
     vectors[1] = u32x4::from_array(vectors[1].as_mut_array().map(|el| el.rotate_left(7)));
-    // vectors[3] = (vectors[3] << *S7) ^ (vectors[3] >> *S25);
+  }
+
+  mod slower {
+    //! experiments that didn't pan out
+
+    // failed experiment for speeding up bit-rotation
+    // static S25: Lazy<u32x4> = Lazy::new(|| u32x4::splat(25));
+    // static S24: Lazy<u32x4> = Lazy::new(|| u32x4::splat(24));
+    // static S20: Lazy<u32x4> = Lazy::new(|| u32x4::splat(20));
+    // static S16: Lazy<u32x4> = Lazy::new(|| u32x4::splat(16));
+    // static S12: Lazy<u32x4> = Lazy::new(|| u32x4::splat(12));
+    // static S8: Lazy<u32x4> = Lazy::new(|| u32x4::splat(8));
+    // static S7: Lazy<u32x4> = Lazy::new(|| u32x4::splat(7));
+
+    #![allow(dead_code)]
+    use super::*;
+    #[inline(always)]
+    pub fn _run_rounds<const R: usize>(state: &[u32; STATE_WORDS]) -> [u32; STATE_WORDS] {
+      let lanes = u32x16::from_array(*state);
+      let mut v0: u32x4 = simd_swizzle!(lanes, [0, 1, 2, 3]);
+      let mut v1: u32x4 = simd_swizzle!(lanes, [4, 5, 6, 7]);
+      let mut v2: u32x4 = simd_swizzle!(lanes, [8, 9, 10, 11]);
+      let mut v3: u32x4 = simd_swizzle!(lanes, [12, 13, 14, 15]);
+
+      // dbg!(v0, v1, v2, v3);
+      for _ in 0..R {
+        (v0, v1, v2, v3) = round(v0, v1, v2, v3);
+        v1 = v1.rotate_lanes_left::<1>();
+        v2 = v2.rotate_lanes_left::<2>();
+        v3 = v3.rotate_lanes_left::<3>();
+        (v0, v1, v2, v3) = round(v0, v1, v2, v3);
+        v1 = v1.rotate_lanes_right::<1>();
+        v2 = v2.rotate_lanes_right::<2>();
+        v3 = v3.rotate_lanes_right::<3>();
+      }
+
+      // let mut res = [0; 16];
+      // for ((val, idx), state_idx) in
+      //   [v0, v1, v2, v3].into_iter().flat_map(|v|
+      // v.to_array()).zip(res.iter_mut()).zip(state.iter()) {
+      //   *idx = val.wrapping_add(*state_idx);
+      // }
+      // res
+
+      // this is 40% slower...*shrug*
+      // let mut res = *state;
+      // for (r, x) in res.iter_mut().zip(vectors.iter().flat_map(|v| v.as_array())) {
+      //   *r = r.wrapping_add(*x);
+      // }
+
+      let mut res = [0; STATE_WORDS];
+      for (vec, chunk) in [v0, v1, v2, v3].into_iter().zip(res.array_chunks_mut::<4>()) {
+        chunk.copy_from_slice(vec.as_array());
+      }
+
+      for (s1, s0) in res.iter_mut().zip(state.iter()) {
+        *s1 = s1.wrapping_add(*s0);
+      }
+      res
+    }
+
+    fn round(
+      mut v0: u32x4,
+      mut v1: u32x4,
+      mut v2: u32x4,
+      mut v3: u32x4,
+    ) -> (u32x4, u32x4, u32x4, u32x4) {
+      v0 += v1;
+      v3 ^= v0;
+      v3 = u32x4::from_array(v3.as_mut_array().map(|el| el.rotate_left(16)));
+      // there doesn't seem to be an efficient way to map bit-rotation across Simd types
+      // v3 = (v3 << *S16) ^ (v3 >> *S16); // muuuch slower (2micros -> 4)
+
+      v2 += v3;
+      v1 ^= v2;
+      v1 = u32x4::from_array(v1.as_mut_array().map(|el| el.rotate_left(12)));
+      // v3 = (v3 << *S12) ^ (v3 >> *S20);
+
+      v0 += v1;
+      v3 ^= v0;
+      v3 = u32x4::from_array(v3.as_mut_array().map(|el| el.rotate_left(8)));
+      // v3 = (v3 << *S8) ^ (v3 >> *S24);
+
+      v2 += v3;
+      v1 ^= v2;
+      v1 = u32x4::from_array(v1.as_mut_array().map(|el| el.rotate_left(7)));
+      // v3 = (v3 << *S7) ^ (v3 >> *S25);
+      (v0, v1, v2, v3)
+    }
   }
 }
 
 // Code beneath this point is only included for benchmark comparison purposes, and is entirely
 // copied from Rust Crypto, with a couple tweaks for const generics
 //
-// 927ns (about 2.5x faster than software)
+// 1.7ms (about 3x faster than software)
 #[cfg(feature = "sse2")]
 mod sse2 {
   #[cfg(target_arch = "x86")] use core::arch::x86::*;
@@ -470,7 +539,7 @@ mod sse2 {
   }
 }
 
-// 271 nanoseconds (about 9x faster than software)
+// 597us (about 9x faster than software)
 #[cfg(feature = "avx2")]
 mod avx2 {
   #[cfg(target_arch = "x86")] use core::arch::x86::*;
