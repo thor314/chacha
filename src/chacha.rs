@@ -361,7 +361,7 @@ mod portable_simd {
 // copied from Rust Crypto, with a couple tweaks for const generics
 //
 // 1.7ms (about 3x faster than software)
-#[cfg(feature = "sse2")]
+// #[cfg(feature = "sse2")]
 mod sse2 {
   #[cfg(target_arch = "x86")] use core::arch::x86::*;
   #[cfg(target_arch = "x86_64")] use core::arch::x86_64::*;
@@ -425,6 +425,7 @@ mod sse2 {
   unsafe fn rounds<const R: usize>(v: &[__m128i; 4]) -> [__m128i; 4] {
     let mut res = *v;
     for _ in 0..R {
+      // experiments::_double_quarter_round(&mut res);
       double_quarter_round(&mut res);
     }
 
@@ -536,6 +537,59 @@ mod sse2 {
     *c = _mm_add_epi32(*c, *d);
     *b = _mm_xor_si128(*b, *c);
     *b = _mm_xor_si128(_mm_slli_epi32(*b, 7), _mm_srli_epi32(*b, 25));
+  }
+
+  mod experiments {
+    #![allow(dead_code)]
+    use super::*;
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    pub unsafe fn _double_quarter_round(v: &mut [__m128i; 4]) {
+      _add_xor_rot(v);
+      _rows_to_cols(v);
+      _add_xor_rot(v);
+      _cols_to_rows(v);
+    }
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn _rows_to_cols([_, b, c, d]: &mut [__m128i; 4]) {
+      *b = _mm_shuffle_epi32(*c, 0b_00_11_10_01); // shift left 1
+      *c = _mm_shuffle_epi32(*c, 0b_01_00_11_10); // shift 2
+      *d = _mm_shuffle_epi32(*c, 0b_10_01_00_11); // shift 3
+    }
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn _cols_to_rows([_, b, c, d]: &mut [__m128i; 4]) {
+      *b = _mm_shuffle_epi32(*c, 0b_10_01_00_11); // shift right 1
+      *c = _mm_shuffle_epi32(*c, 0b_01_00_11_10); // shift 2
+      *d = _mm_shuffle_epi32(*c, 0b_00_11_10_01); // shift 3
+    }
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn _add_xor_rot([a, b, c, d]: &mut [__m128i; 4]) {
+      // a += b; d ^= a; d <<<= (16, 16, 16, 16);
+      *a = _mm_add_epi32(*a, *b);
+      *d = _mm_xor_si128(*d, *a);
+      *d = _mm_xor_si128(_mm_slli_epi32(*d, 16), _mm_srli_epi32(*d, 16));
+
+      // c += d; b ^= c; b <<<= (12, 12, 12, 12);
+      *c = _mm_add_epi32(*c, *d);
+      *b = _mm_xor_si128(*b, *c);
+      *b = _mm_xor_si128(_mm_slli_epi32(*b, 12), _mm_srli_epi32(*b, 20));
+
+      // a += b; d ^= a; d <<<= (8, 8, 8, 8);
+      *a = _mm_add_epi32(*a, *b);
+      *d = _mm_xor_si128(*d, *a);
+      *d = _mm_xor_si128(_mm_slli_epi32(*d, 8), _mm_srli_epi32(*d, 24));
+
+      // c += d; b ^= c; b <<<= (7, 7, 7, 7);
+      *c = _mm_add_epi32(*c, *d);
+      *b = _mm_xor_si128(*b, *c);
+      *b = _mm_xor_si128(_mm_slli_epi32(*b, 7), _mm_srli_epi32(*b, 25));
+    }
   }
 }
 
