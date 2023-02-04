@@ -229,8 +229,8 @@ mod portable_simd {
     for _ in 0..R {
       round(&mut vectors);
       vectors[1] = vectors[1].rotate_lanes_left::<1>();
-      vectors[2] = vectors[2].rotate_lanes_left::<2>();
       vectors[3] = vectors[3].rotate_lanes_left::<3>();
+      vectors[2] = vectors[2].rotate_lanes_left::<2>();
       round(&mut vectors);
       vectors[1] = vectors[1].rotate_lanes_right::<1>();
       vectors[2] = vectors[2].rotate_lanes_right::<2>();
@@ -361,7 +361,7 @@ mod portable_simd {
 // copied from Rust Crypto, with a couple tweaks for const generics
 //
 // 1.7ms (about 3x faster than software)
-// #[cfg(feature = "sse2")]
+#[cfg(feature = "sse2")]
 mod sse2 {
   #[cfg(target_arch = "x86")] use core::arch::x86::*;
   #[cfg(target_arch = "x86_64")] use core::arch::x86_64::*;
