@@ -482,11 +482,19 @@ mod sse2 {
   /// - https://github.com/floodyberry/chacha-opt/blob/0ab65cb99f5016633b652edebaf3691ceb4ff753/chacha_blocks_ssse3-64.S#L639-L643
   #[inline]
   #[target_feature(enable = "sse2")]
-  unsafe fn rows_to_cols([a, _, c, d]: &mut [__m128i; 4]) {
+  unsafe fn rows_to_cols([a, _b, c, d]: &mut [__m128i; 4]) {
     // c >>>= 32; d >>>= 64; a >>>= 96;
     *c = _mm_shuffle_epi32(*c, 0b_00_11_10_01); // _MM_SHUFFLE(0, 3, 2, 1)
     *d = _mm_shuffle_epi32(*d, 0b_01_00_11_10); // _MM_SHUFFLE(1, 0, 3, 2)
     *a = _mm_shuffle_epi32(*a, 0b_10_01_00_11); // _MM_SHUFFLE(2, 1, 0, 3)
+                                                // floodberry optimization produces a ~6%
+                                                // performance improvement over naive impl:
+                                                // *_b = _mm_shuffle_epi32(*_b, 0b_00_11_10_01); //
+                                                // _MM_SHUFFLE(0, 3, 2, 1)
+                                                // *c = _mm_shuffle_epi32(*c, 0b_01_00_11_10); //
+                                                // _MM_SHUFFLE(1, 0, 3, 2)
+                                                // *d = _mm_shuffle_epi32(*d, 0b_10_01_00_11); //
+                                                // _MM_SHUFFLE(2, 1, 0, 3)
   }
 
   /// The goal of this function is to transform the state words from:
@@ -508,11 +516,18 @@ mod sse2 {
   /// reversing the transformation of [`rows_to_cols`].
   #[inline]
   #[target_feature(enable = "sse2")]
-  unsafe fn cols_to_rows([a, _, c, d]: &mut [__m128i; 4]) {
+  unsafe fn cols_to_rows([a, _b, c, d]: &mut [__m128i; 4]) {
     // c <<<= 32; d <<<= 64; a <<<= 96;
     *c = _mm_shuffle_epi32(*c, 0b_10_01_00_11); // _MM_SHUFFLE(2, 1, 0, 3)
     *d = _mm_shuffle_epi32(*d, 0b_01_00_11_10); // _MM_SHUFFLE(1, 0, 3, 2)
     *a = _mm_shuffle_epi32(*a, 0b_00_11_10_01); // _MM_SHUFFLE(0, 3, 2, 1)
+                                                // without floodberry optimization:
+                                                // *_b = _mm_shuffle_epi32(*_b, 0b_10_01_00_11); //
+                                                // _MM_SHUFFLE(2, 1, 0, 3)
+                                                // *c = _mm_shuffle_epi32(*c, 0b_01_00_11_10); //
+                                                // _MM_SHUFFLE(1, 0, 3, 2)
+                                                // *d = _mm_shuffle_epi32(*d, 0b_00_11_10_01); //
+                                                // _MM_SHUFFLE(0, 3, 2, 1)
   }
 
   #[inline]
