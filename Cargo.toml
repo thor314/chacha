@@ -26,6 +26,7 @@ zeroize={ version="1.5.7", features=["zeroize_derive"] }
 simd=[]
 avx2=[]
 sse2=[]
+neon=[]
 
 [dev-dependencies]
 hex-literal="0.3.4"
