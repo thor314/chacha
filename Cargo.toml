@@ -27,7 +27,7 @@ sse2=[]
 neon=[]
 
 [dev-dependencies]
-hex-literal="0.3.4"
+hex-literal="0.4.1"
 
 ## Bench ##
 criterion="0.4"
