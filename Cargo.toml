@@ -1,10 +1,8 @@
 [package]
 authors    =["Thor Kamphefner <thorck@pm.me>"]
-description="""cryptography algorithms in Rust"""
 edition    ="2021"
 license    ="Apache2.0 OR MIT"
-name       ="tkcrypto"
-repository ="https://github.com/thor314/tkcrypto"
+name       ="chacha"
 version    ="0.1.0"
 
 [dependencies]
@@ -33,21 +31,3 @@ hex-literal="0.3.4"
 
 ## Bench ##
 criterion="0.4"
-# iai = "0.1" # criterion alternative
-
-## Testing utils
-# arbitrary = { version = "1.1", features = ["derive"] } # see quickcheck
-# test-log =  { version = "0.2", default-features = false, features = ["trace"] } 
-# test-log = "0.2"        # log/tracing independent test-log consumer
-
-# quickcheck = "1.0"      # lowkey proptest suite
-# quickcheck_macros = "1" # derive 
-# rstest = "0.16"         # testing convenience proc-macros
-
-[[test]]
-name="chacha"
-path="tests/chacha.rs"
-
-[[bench]]
-name   ="bench"
-harness=false

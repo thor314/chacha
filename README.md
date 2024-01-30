@@ -1,2 +1,2 @@
-# tkcrypto
-Cryptography Algorithms in Rust
+# toy implementation of the CHACHA20 stream cipher
+
