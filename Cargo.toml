@@ -30,4 +30,4 @@ neon=[]
 hex-literal="0.4.1"
 
 ## Bench ##
-criterion="0.4"
+criterion="0.5"
